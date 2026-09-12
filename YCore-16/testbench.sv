@@ -1,213 +1,183 @@
 `timescale 1ns/1ps
 `default_nettype none
-
 module testbench;
-
-    logic clk;
-    logic rst;
-
-    wire [15:0] instr_addr;
-    wire [23:0] instr_data;
-    wire [15:0] data_addr;
-    wire [15:0] data_wdata;
-    wire [15:0] data_rdata;
-    wire        data_we;
-    wire        zero_flag;
-    wire        halted;
-
-    logic [23:0] rom [0:65535];
-    logic [15:0] ram [0:65535];
-
-    integer cycles;
-    integer writes;
-    integer i;
-
-    YCore_16 dut (
-        .clk        (clk),
-        .rst        (rst),
-        .instr_addr (instr_addr),
-        .instr_data (instr_data),
-        .data_addr  (data_addr),
-        .data_wdata (data_wdata),
-        .data_rdata (data_rdata),
-        .data_we    (data_we),
-        .zero_flag  (zero_flag),
-        .halted     (halted)
-    );
-
-    assign instr_data = rom[instr_addr];
-    assign data_rdata = ram[data_addr];
-
-    always @(posedge clk) begin
-        if (!rst && data_we) begin
-            ram[data_addr] <= data_wdata;
-            writes <= writes + 1;
+    logic clk=0, reset=1;
+    always #5 clk=~clk;
+    wire [1:0] halted,fault;
+    wire [31:0] pc0,pc1;
+    wire [7:0] fc0,fc1;
+    YCore_16 dut(.clk(clk),.reset(reset),.halted(halted),.fault(fault),
+        .pc0(pc0),.pc1(pc1),.fault_code0(fc0),.fault_code1(fc1));
+    integer checks=0, conflicts=0, cycles, n, idx, t;
+    reg [31:0] expected, v;
+    reg [15:0] xv,yv;
+    reg signed [31:0] sx,sy;
+    function automatic [31:0] enc(input [7:0] op,input [3:0] rd,ra,input [15:0] imm);
+        enc={op,rd,ra,imm};
+    endfunction
+    task automatic check(input logic condition,input string message);
+        begin
+            checks=checks+1;
+            if(condition!==1'b1) $fatal(1,"FAIL: %s",message);
         end
-    end
-
-    initial clk = 1'b0;
-    always #5 clk = ~clk;
-
-    function automatic logic [23:0] rr (
-        input logic [3:0] op,
-        input logic [2:0] rd,
-        input logic [2:0] rs
-    );
-        rr = {op, rd, rs, 14'b0};
-    endfunction
-
-    function automatic logic [23:0] ri (
-        input logic [3:0]  op,
-        input logic [2:0]  rd,
-        input logic [15:0] imm
-    );
-        ri = {op, rd, 1'b0, imm};
-    endfunction
-
-    task automatic check16 (
-        input string       name,
-        input logic [15:0] actual,
-        input logic [15:0] expected
-    );
-        if (actual !== expected)
-            $fatal(1, "%s: expected=%04h, got=%04h",
-                   name, expected, actual);
     endtask
-
+    task automatic fresh;
+        begin
+            @(negedge clk); reset=1;
+            repeat(2) @(negedge clk);
+            // Test-only ROM edits. Real hardware ROM is never writable.
+            for(n=0;n<512;n=n+1) dut.mem.rom[n]=0;
+            dut.mem.rom[0]=32'h01000000;
+            dut.mem.rom[64]=32'h01000000;
+            idx=0;
+        end
+    endtask
+    task automatic emit(input [7:0] op,input [3:0] rd,ra,input [15:0] imm);
+        begin dut.mem.rom[idx]=enc(op,rd,ra,imm); idx=idx+1; end
+    endtask
+    task automatic run_program;
+        begin
+            @(negedge clk); reset=0; cycles=0;
+            while(halted!==2'b11 && cycles<2000) begin
+                @(negedge clk); cycles=cycles+1;
+            end
+            check(halted===2'b11,"watchdog: both cores halt");
+        end
+    endtask
+    always @(posedge clk) if(!reset) begin
+        check(!(dut.ready==2'b11),"single data transaction per cycle");
+        if(dut.req==2'b11) conflicts=conflicts+1;
+    end
     initial begin
-        rst    = 1'b1;
-        cycles = 0;
-        writes = 0;
-
-        for (i = 0; i < 65536; i = i + 1) begin
-            rom[i] = 24'hF00000;
-            ram[i] = 16'h0000;
+        if($test$plusargs("vcd")) begin
+            $dumpfile("ycore16.vcd"); $dumpvars(0,testbench);
         end
+        repeat(3) @(negedge clk);
+        run_program();
+        check(fault==0,"demo no fault");
+        check(dut.mem.ram[0]===16'd0 && dut.mem.ram[8]===16'd1,"core IDs");
+        check(dut.mem.ram[1]===16'd65 && dut.mem.ram[2]===16'd0,"core0 MAC+DOT");
+        check(dut.mem.ram[3]===16'd65,"core0 ReLU");
+        check(dut.mem.ram[9]===16'hfff1 && dut.mem.ram[10]===16'hffff,"negative MAC");
+        check(dut.mem.ram[11]===16'd0,"negative ReLU");
+        check(dut.core0.r[7]===16'd65 && dut.core1.r[7]===16'hfff1,"load after store");
+        check(conflicts>0,"simultaneous data requests exercised");
+        $display("PASS demo and dual-core contention");
 
-        rom[0]  = ri(4'h1, 3'd0, 16'd65530);  // LDI R0,65530
-        rom[1]  = ri(4'h1, 3'd1, 16'd10);     // LDI R1,10
-        rom[2]  = rr(4'h2, 3'd0, 3'd1);       // ADD R0,R1   -> 0004 (overflow)
-        rom[3]  = ri(4'hA, 3'd0, 16'h8000);   // ST  R0,8000
-        rom[4]  = ri(4'h9, 3'd2, 16'h8000);   // LD  R2,8000 -> 0004
-        rom[5]  = rr(4'h3, 3'd2, 3'd1);       // SUB R2,R1   -> FFFA
+        fresh();
+        emit('h03,1,0,'hfffd); emit('h03,2,0,5);
+        emit('h10,3,1,'h2000); emit('h11,4,1,'h2000);
+        emit('h12,5,1,'h2000); emit('h13,6,1,'h2000);
+        emit('h14,7,1,'h2000); emit('h15,8,1,0);
+        emit('h16,9,2,'h2000); emit('h17,10,1,'h2000);
+        emit('h18,11,1,'h2000); emit('h19,12,1,'h2000);
+        emit('h1b,13,1,'h2000); emit('h1c,14,1,'h2000);
+        emit('h1a,15,2,'hffff); emit('h03,0,0,'hffff); emit('h01,0,0,0);
+        run_program();
+        check(fault==0,"ALU no fault");
+        check(dut.core0.r[0]===0,"r0 immutable");
+        check(dut.core0.r[3]===16'd2 && dut.core0.r[4]===16'hfff8,"ADD SUB wrap");
+        check(dut.core0.r[5]===5 && dut.core0.r[6]===16'hfffd && dut.core0.r[7]===16'hfff8,"bitwise");
+        check(dut.core0.r[8]===2 && dut.core0.r[9]===160,"NOT SHL");
+        check(dut.core0.r[10]===16'h07ff && dut.core0.r[11]===16'hffff,"SHR SAR");
+        check(dut.core0.r[12]===16'hfff1,"MUL low");
+        check(dut.core0.r[13]===1 && dut.core0.r[14]===0 && dut.core0.r[15]===4,"signed unsigned ADDI");
+        $display("PASS integer ALU");
 
-        rom[6]  = rr(4'hE, 3'd3, 3'd2);       // MOV R3,R2   -> FFFA
-        rom[7]  = rr(4'h4, 3'd3, 3'd1);       // AND R3,R1   -> 000A
-        rom[8]  = rr(4'h5, 3'd3, 3'd0);       // OR  R3,R0   -> 000E
-        rom[9]  = rr(4'h6, 3'd3, 3'd1);       // XOR R3,R1   -> 0004
-        rom[10] = rr(4'h7, 3'd3, 3'd0);       // SHL R3      -> 0008
-        rom[11] = rr(4'h8, 3'd2, 3'd0);       // SHR R2      -> 7FFD
+        fresh();
+        emit('h03,1,0,3); // loop count
+        emit('h1a,1,1,'hffff);
+        emit('h41,1,0,'hfffe); // back to decrement
+        emit('h40,1,0,1); // skip illegal opcode
+        emit('hff,0,0,0);
+        emit('h03,2,0,'hffff);
+        emit('h42,2,0,1); // -1 < 0 -> skip fault
+        emit('hff,0,0,0);
+        emit('h30,1,0,'h0080); // a1 subroutine at 0x80
+        emit('h44,0,1,0);
+        emit('h04,4,3,0); emit('h01,0,0,0);
+        idx=32; emit('h03,3,0,'hbeef); emit('h45,0,0,0);
+        run_program();
+        check(fault==0 && dut.core0.r[1]===0 && dut.core0.r[4]===16'hbeef,"branches CALL RET MOV");
+        check({dut.core0.r[15],dut.core0.r[14]}===32'd40,"32-bit return address");
+        $display("PASS branch loop and subroutine");
 
-        rom[12] = ri(4'hC, 3'd0, 16'hFF00);   // JZ FF00 (not taken, Z=0)
+        fresh();
+        emit('h31,2,0,'h1000); emit('h30,2,0,'h7ffe);
+        emit('h03,1,0,'h1234); emit('h21,1,2,0); emit('h20,3,2,0);
+        emit('h03,4,0,'hfffe); emit('h32,2,4,0);
+        emit('h33,5,2,0); emit('h34,6,2,0);
+        emit('h21,1,2,0); emit('h20,7,2,2);
+        emit('h20,8,0,0); emit('h20,9,0,2); // two ROM halfwords
+        emit('h01,0,0,0); run_program();
+        check(fault==0 && dut.mem.ram[16383]===16'h1234,"RAM top boundary");
+        check(dut.core0.r[3]===16'h1234 && dut.core0.r[7]===16'h1234,"32-bit effective address");
+        check(dut.core0.r[5]===16'h7ffc && dut.core0.r[6]===16'h1000,"address add and extraction");
+        check(dut.core0.r[8]===16'h1000 && dut.core0.r[9]===16'h3120,"ROM little endian data reads");
+        $display("PASS address registers, RAM boundary, ROM reads");
 
-        rom[13] = ri(4'h1, 3'd4, 16'd3);      // LDI R4,3
-        rom[14] = ri(4'h1, 3'd5, 16'd1);      // LDI R5,1
-        rom[15] = rr(4'h3, 3'd4, 3'd5);       // SUB R4,R5           <-- loop start
-        rom[16] = ri(4'hD, 3'd0, 16'd15);     // JNZ 15              (3 iterations)
-
-        rom[17] = ri(4'hC, 3'd0, 16'd19);     // JZ 19 (taken, Z=1 after loop)
-        rom[18] = ri(4'hA, 3'd1, 16'hEEEE);   // should not execute
-
-        rom[19] = ri(4'hB, 3'd0, 16'h1234);   // JMP 1234 (address beyond 8 bits)
-        rom[20] = ri(4'hA, 3'd1, 16'hEEEE);   // should not execute
-
-        rom[16'h1234] = 24'h000000;                // NOP
-        rom[16'h1235] = ri(4'hA, 3'd3, 16'h8001);  // ST R3,8001
-        rom[16'h1236] = 24'hF00000;                // HALT
-
-        rom[16'hFF00] = ri(4'hA, 3'd1, 16'hEEEE);  // bad-branch guard target
-        rom[16'hFF01] = 24'hF00000;
-
-        repeat (2) @(posedge clk);
-        @(negedge clk);
-
-        check16("Reset PC", instr_addr, 16'h0000);
-
-        for (i = 0; i < 8; i = i + 1)
-            check16($sformatf("Reset R%0d", i),
-                    dut.regs[i], 16'h0000);
-
-        if (halted !== 1'b0 || zero_flag !== 1'b0 ||
-            data_we !== 1'b0)
-            $fatal(1, "Reset control signals are incorrect");
-
-        rst = 1'b0;
-
-        while ((halted !== 1'b1) && cycles < 100) begin
-            @(posedge clk);
-            #1;
-            cycles = cycles + 1;
-
-            if (cycles == 3)
-                check16("16-bit ADD overflow",
-                        dut.regs[0], 16'h0004);
-
-            if (cycles == 5)
-                check16("Single-cycle LD",
-                        dut.regs[2], 16'h0004);
-
-            if (cycles == 6)
-                check16("16-bit SUB result",
-                        dut.regs[2], 16'hFFFA);
+        fresh();
+        dut.mem.ram[0]=16'h1234;
+        for(t=0;t<2;t=t+1) begin
+            idx=t*64;
+            emit('h31,0,0,'h1000); emit('h03,1,0,t==0 ? 16'haaaa : 16'hbbbb);
+            emit('h22,1,0,0); emit('h01,0,0,0);
         end
+        run_program();
+        check(fault==0,"XCHG no fault");
+        check(dut.core0.r[1]===16'h1234 && dut.core1.r[1]===16'haaaa && dut.mem.ram[0]===16'hbbbb,"serialized atomic exchange");
+        $display("PASS atomic cross-core exchange");
 
-        if (halted !== 1'b1)
-            $fatal(1, "Timeout: HALT never asserted");
-
-        if (cycles != 26)
-            $fatal(1, "Cycle count: expected=26, got=%0d",
-                   cycles);
-
-        check16("R0", dut.regs[0], 16'h0004);
-        check16("R1", dut.regs[1], 16'h000A);
-        check16("R2", dut.regs[2], 16'h7FFD);
-        check16("R3", dut.regs[3], 16'h0008);
-        check16("R4", dut.regs[4], 16'h0000);
-        check16("R5", dut.regs[5], 16'h0001);
-        check16("R6", dut.regs[6], 16'h0000);
-        check16("R7", dut.regs[7], 16'h0000);
-
-        check16("RAM[8000]", ram[16'h8000], 16'h0004);
-        check16("RAM[8001]", ram[16'h8001], 16'h0008);
-        check16("Branch guard (untouched)", ram[16'hEEEE], 16'h0000);
-        check16("HALT PC", instr_addr, 16'h1236);
-
-        if (zero_flag !== 1'b1 || writes != 2)
-            $fatal(1, "Zero flag or memory write count is incorrect");
-
-        repeat (3) begin
-            @(posedge clk);
-            #1;
-
-            check16("HALT PC stability", instr_addr, 16'h1236);
-
-            if (data_we !== 1'b0 || halted !== 1'b1 || writes != 2)
-                $fatal(1, "State changed while halted");
+        // Deterministic pseudo-random signed accelerator comparisons.
+        v=32'h1a2b3c4d;
+        for(t=0;t<24;t=t+1) begin
+            v=v*32'd1664525+32'd1013904223; xv=v[15:0];
+            v=v*32'd1664525+32'd1013904223; yv=v[15:0];
+            sx={{16{xv[15]}},xv}; sy={{16{yv[15]}},yv}; expected=sx*sy;
+            fresh();
+            emit('h03,1,0,xv); emit('h03,2,0,yv);
+            emit('h50,0,0,0); emit('h51,0,1,'h2000);
+            emit('h53,3,0,0); emit('h54,4,0,0); emit('h55,5,0,0);
+            emit('h01,0,0,0); run_program();
+            check({dut.core0.r[4],dut.core0.r[3]}===expected,"random signed MAC");
+            check(dut.core0.r[5]===(expected[31]?16'd0:expected>32767?16'd32767:expected[15:0]),"random saturated ReLU");
+            sx={{24{xv[7]}},xv[7:0]}; sy={{24{yv[7]}},yv[7:0]}; expected=sx*sy;
+            sx={{24{xv[15]}},xv[15:8]}; sy={{24{yv[15]}},yv[15:8]}; expected=expected+sx*sy;
+            fresh();
+            emit('h03,1,0,xv); emit('h03,2,0,yv);
+            emit('h52,0,1,'h2000); emit('h53,3,0,0); emit('h54,4,0,0);
+            emit('h01,0,0,0); run_program();
+            check({dut.core0.r[4],dut.core0.r[3]}===expected,"random packed int8 dot product");
         end
+        fresh();
+        emit('h03,1,0,'h7fff); emit('h03,2,0,'hffff);
+        emit('h56,0,1,'h2000); // bias = 0x7fffffff
+        emit('h03,3,0,1); emit('h51,0,3,'h3000);
+        emit('h53,4,0,0); emit('h54,5,0,0); emit('h55,6,0,0);
+        emit('h01,0,0,0); run_program();
+        check({dut.core0.r[5],dut.core0.r[4]}===32'h80000000 && dut.core0.r[6]===0,"bias and accumulator overflow wrap");
+        $display("PASS 48 randomized AI cases, saturation and overflow");
 
-        @(negedge clk);
-        rst = 1'b1;
-        #1;
-
-        check16("Post-HALT reset PC", instr_addr, 16'h0000);
-
-        for (i = 0; i < 8; i = i + 1)
-            check16($sformatf("Post-HALT reset R%0d", i),
-                    dut.regs[i], 16'h0000);
-
-        if (halted !== 1'b0 || zero_flag !== 1'b0 ||
-            data_we !== 1'b0)
-            $fatal(1, "Reset after HALT failed");
-
-        $display("PASS: All YCore-16 tests passed.");
+        // Precise error classes, no invalid write side effects.
+        for(t=0;t<6;t=t+1) begin
+            fresh(); dut.mem.ram[0]=16'h55aa;
+            case(t)
+                0: emit('hff,0,0,0);
+                1: begin emit('h30,0,0,1); emit('h43,0,0,0); end
+                2: begin emit('h31,0,0,2); emit('h43,0,0,0); end
+                3: begin emit('h31,0,0,'h1000); emit('h21,0,0,1); end
+                4: emit('h21,0,0,0); // ROM write
+                5: begin emit('h31,0,0,'h1000); emit('h30,0,0,'h8000); emit('h20,1,0,0); end
+            endcase
+            run_program();
+            check(fault===2'b01,"only offending core faults");
+            check(fc0===(t==0?8'd2:t<3?8'd1:8'd3),"fault category");
+            check(dut.mem.ram[0]===16'h55aa,"invalid access does not corrupt RAM");
+        end
+        $display("PASS illegal opcode, fetch alignment/range, data alignment/range and ROM protection");
+        $display("ALL TESTS PASSED: %0d checks; %0d contention cycles",checks,conflicts);
         $finish;
     end
-
-    initial begin
-        #2000;
-        $fatal(1, "Global simulation timeout");
-    end
-
+    initial begin #1000000; $fatal(1,"global timeout"); end
 endmodule
-
 `default_nettype wire
